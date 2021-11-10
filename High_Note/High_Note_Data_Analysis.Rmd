@@ -1,0 +1,688 @@
+---
+title: "High Note Data Analysis"
+author: "Jisoo Park"
+#date: "`r format(Sys.time(), '%B %d, %Y')`"
+date: "Last compiled date is `r format(Sys.Date())`"
+output:
+  html_document:
+    code_folding: hide
+    fig_height: 6
+    fig_width: 10
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+Sys.setlocale("LC_TIME", "C")
+options(scipen = 100000)
+```
+
+## Business Understanding; Problem definition
+
+* Business Understanding: 
+
+This capability would allow the business units to plan accordingly with regards to business strategies of optimizing the target customer and maximizing the conversion rate.
+
+* Data Understanding:
+
+This data set consists of 38 variables (or features), including the `adopter` variables indicating the target variable. These variables help to understand the characteristics of the customer; how many friends they have, how many months they have used the service. This data set has relatively many missing values and a few outliers.
+
+Although the data has consisted of three parts- Pre, Current, Post, causation can not be drawn because there are no proper features regarding time. Only correlation would be considered.
+
+* Problem definition:
+
+  * Which variable has an impact on premium customer
+  * How can cluster customers
+
+
+```{r libraries, include=FALSE}
+suppressMessages({
+  library(readr)      # read file
+  library(tidyverse)  # data manipulation
+  library(data.table) # data handling
+  library(tidymodels) # build work flow
+  library(ggplot2);theme_set(theme_minimal())
+  library(ggpubr)     # multiple plots in one figure
+  library(ROSE)       # sampling method
+  library(ranger)     # random forest
+})
+
+```
+
+```{r load_data, message=FALSE}
+dt <- readr::read_csv("High Note data.csv")
+# sum(is.na(dt))
+```
+
+Total number of missing variables are `r scales::comma(sum(is.na(dt)))` among `r scales::comma(nrow(dt))`
+
+Data Description:
+
+* The target variable(Y);
+  - `adopter`: 1 = the user switched from being FREE to PREMIUM. They have never been premium before.
+
+* X variables: 
+  - `friend_cnt`: # of friends
+  - `friend_country_cnt`: # of international friends
+  - `subscriber_friend_cnt`: # of subscriber friends
+  - `songsListened`: cumulative number of songs listened to
+  - `lovedTracks`: # of tracks loved
+  - `playlists`: # of playlists made
+  - `posts`: # of Q&A forum posts
+  - `shouts`: # of shouts received from other users
+  - `good_country`: 1 = UK/US/Germany, 0 = otherwise
+  - `tenure`: how long has the user been on the site (in months)
+  - `gender`: 0 = Female, 1 = Male, Unknown = NULL
+  - `age`: User age
+
+## Pre-processing data
+
+There are 8 users with duplicated IDs. It looks like a technical issue when pulling the data out from the database. These 8 users are not related to the premium customers, thus, we decide to delete them due to being out-of-scope of this analysis. The total number of data is `r scales::comma(nrow(dt))`
+
+```{r duplicated_user}
+dt[which(duplicated(dt$net_user)), c(1, 24)] # there was no adopter
+
+dt <- dt[-which(duplicated(dt$net_user)),] %>% 
+  dplyr::rename(ID = net_user,
+                gender = male) %>% 
+  rename_with(.fn = ~ str_replace(.x, "delta1_", "Pre_"),
+              .cols = starts_with("delta1_")) %>% 
+  rename_with(.fn = ~ str_replace(.x, "delta2_", "Post_"),
+              .cols = starts_with("delta2_"))
+```
+
+### Missing variables
+
+Data is cleaned as a pre-processing step. Missing values are filled with `0` or `Unknown` as appropriate.
+on the current basis missing variables:
+
+  - age: 47.4%
+    - Missing values in the `age` column are replaced with `avg_friend_age` based on the assumption that customer tends to connect with their age.
+    - In addition, based on the imputation, make a group category.
+  - good_country: 36.5%
+    - Missing values in the `good_country` column are replaced with `Unknown` values since other imputation methods are not effective here 
+  - gender: 36.3%
+    - Missing values in the `gender` column are replaced with `Unknown`, and note it has three categories which are `0`, `1`, `Unknown`.
+  - shouts: 1.8%
+    - Missing values in the `shouts` column are replaced with `0`s since that is the most common.
+
+  - tenure: 0.03%
+    - Missing values in the `tenure` column are replaced with `0`s since that is the most common.
+  - friend_cnt, friend_country_cnt, subscriber_fiend_cnt:  It has only 1 missing variable of each. These come from the same user-`danekl` so it was deleted.
+
+```{r missing_percentage}
+# skimr::skim(dt)
+
+dt_miss <- dt %>% 
+  select(-c(matches("Pre_"), matches("Post_"), 
+            matches("avg_")))
+
+dt_miss <- data.frame(
+  colnames = colnames(dt_miss),
+  tot_cnt = dim(dt_miss)[1],
+  missing_cnt = colSums(is.na(dt_miss))) %>% 
+  mutate(missing_perc = round(missing_cnt/tot_cnt, 3)) %>% 
+  arrange(missing_cnt) %>%
+  mutate(name = factor(colnames, levels = colnames))
+
+dt_miss %>% 
+  ggplot(aes(name, missing_perc, label = missing_cnt)) +
+  geom_segment(aes(x = name, xend = name, 
+                   y = 0, yend = missing_perc)) +
+  geom_point() +
+  geom_text(size = 3, vjust = -0.5) +
+  labs(x = "", y = "% of Missing",
+       title = "Fig1. The percentage of missing variables") +
+  scale_y_continuous(labels = scales::percent,
+                     limit = c(0, 0.5),
+                     breaks = c(0, 0.1, 0.2, 0.3, 0.4, 0.5)) +
+  coord_flip()
+```
+
+### Create new variables
+
+* age_group:
+  - age < 18 : Under18
+  - 18 $\le$ age $\le$ 35 : 18-35
+  - 35 $\le$ age $\le$ 80 : Over35
+  - Null: Unknown
+
+The original `age` data has 47% missing variables. Using `avg_friend_age` to replace the missing variable and split it into an age group. This is based on the assumption that the user has a friend of similar age. Since `avg_friend_age` is used to make a new variable, it is not taken into account as a variable. Another option for dealing with the missing variable is simply deleting, or randomly imputing a value in the range between the minimum and maximum value.
+
+* gender_group
+  - 0: Female
+  - 1: Male
+  - Unknown: NULL
+  
+The original `good_country` has 37% missing values. These are replaced with unknown instead of one of the categories.
+
+* good_country_group:
+  - 0 = otherwise,
+  - 1 = UK/US/Germany,
+  - Unknown = NULL
+
+```{r new_vars}
+dt2 <- dt %>% 
+  mutate(gender_gr = ifelse(is.na(gender) == TRUE, "Unknown", ifelse(gender == 1, "Male", "Female")),
+         age_gr = case_when(
+           age < 18 ~ "Under18",
+           age < 35 ~ "18-35",
+           age < 80 ~ "Over35",
+           TRUE ~ "Unknown") %>% 
+           factor(level = c("Under18", "18-35","Over35", "Unknown")),
+         good_country = case_when(
+           good_country == 1 ~ "UK/US/Germany",
+           good_country == 0 ~ "Elsewhere",
+           TRUE ~ "Unknown"),
+         tenure = ifelse(is.na(tenure) == TRUE, 0, tenure),
+         shouts = ifelse(is.na(shouts) == TRUE, 0, shouts),
+         adopter = as.factor(adopter)) %>% 
+  mutate_if(is.character, as.factor)
+
+df <- dt2 %>% 
+  filter(is.na(friend_cnt) == FALSE) %>% 
+  select(-c(matches("Pre_"), matches("Post_"), matches("avg_"), age, gender))
+```
+
+
+## EDA
+
+correlation within numerical variables.
+
+```{r corrplot}
+# p_value <- df %>% 
+#   mutate(adopter = as.numeric(adopter)) %>% 
+#   select(where(is.numeric)) %>% 
+#   corrplot::cor.mtest(method='pearson')
+
+df %>% 
+  mutate(adopter = as.numeric(adopter)) %>% 
+  select(where(is.numeric)) %>% 
+  cor() %>% 
+  corrplot::corrplot(method = "number", type = "lower")
+  # corrplot::corrplot.mixed(p.mat=p_value[[1]], sig.level=.05, 
+  #                lower = 'number', upper='pie', tl.cex=.6,
+  #                tl.col='black',order='hclust')
+```
+
+```{r descriptive_statistics, include=FALSE}
+df %>% 
+  group_by(adopter) %>%
+  summarise(across(where(is.numeric), list(mean = mean, median = median, sd = sd))) %>% view
+```
+
+
+### Numerical variables {.tabset}
+
+The target variable-`adopter` is highly imbalanced data because its proportion of premium is only 7%. It means that we need to apply the sampling method before applying it to the machine learning method.
+
+```{r adopter}
+
+prop.table(table(dt2$adopter)) # Highly imbalanced data
+dt2 %>% # adopter(Y)
+  group_by(adopter) %>% 
+  summarise(n = n(),
+            prop = n/nrow(.), 
+            label = scales::percent(prop)) %>% 
+  ggplot(aes(x = adopter, y = n,label = label)) +
+  geom_col(aes(fill = adopter), width = 0.6) +
+  geom_text(vjust = -0.25) +
+  labs(title = "Fig2. Customer distribution",
+       subtitle = "0: Free, 1: Premium customer") +
+  scale_y_continuous(labels = scales::comma) +
+  theme(axis.title = element_blank(),
+        legend.position = c(0.95, 0.95))
+```
+
+`adopter` has two categories which are only a Free customer(`0`) and a Premium customer(`1`) so we consider it is a binary.
+
+The below box plots are for checking the differences between Free customers and Premium customers according to the numeric variables. We can see more clear differences when we take out the outliers.
+
+We detect some extreme outliers in the boxplots. In addition, some variables such as `lovedTracks`, `songsListened`, and `subscriber_friend_cnt` have distinct mean differences between the free customer and premium customer. We assume that it would be considered an important variable in the model.
+
+#### friend_count
+
+```{r friend_cnt}
+ggpubr::ggarrange(
+df %>% # adopter X friend_cnt 
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = friend_cnt,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of Friend",
+    title = "Fig 3.1 Boxplot of the number of friends",
+    subtitle = "Whole data") +
+  theme(legend.position = c(0.95, 0.95)),
+
+df %>% # adopter X friend_cnt
+  filter(friend_cnt < 50) %>%
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = friend_cnt,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of Friend",
+    title = "",
+    subtitle = "where below # of friends < 50") +
+  theme(legend.position = c(0.95, 0.95))
+)
+```
+
+#### friend_country_count
+This explains whether the user has a diverse. 
+
+```{r friend_country_cnt}
+ggpubr::ggarrange(
+df %>% # adopter X friend_country_cnt
+  ggplot() + 
+  geom_boxplot(aes(x = adopter, y = friend_country_cnt,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of friends from different countries",
+       title = "Fig3.2 Boxplot of the number of international friends",
+       subtitle = "Whole data") +
+  theme(legend.position = c(0.95, 0.95)),
+
+df %>% # adopter X friend_country_cnt
+  filter(friend_country_cnt < 25) %>% 
+  ggplot() + 
+  geom_boxplot(aes(x = adopter, y = friend_country_cnt,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of friends from different countries",
+       title = "",
+       subtitle = "Where below # international friends < 25")+
+  theme(legend.position = c(0.95, 0.95)))
+```
+
+#### songsListened
+
+```{r songsListened}
+ggpubr::ggarrange(
+df %>% # adopter X songsListened
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = songsListened,
+               fill = adopter), width = 0.6) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "", y = "# of Listened Songs",
+       title = "Fig 3.3 Boxplot of songsListened",
+       subtitle = "Whole data") +
+  theme(legend.position = c(0.95, 0.95)) ,
+
+df %>% # adopter X songsListened
+  filter(songsListened < 100000) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = songsListened,
+               fill = adopter), width = 0.6) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "", y = "# of Listened Songs",
+       title = "",
+       subtitle = "Where below 100,000") +
+  theme(legend.position = c(0.95, 0.95))
+)
+```
+
+#### subscriber_country_cnt
+
+```{r subscriber_country_cnt}
+ggpubr::ggarrange(
+df %>% # adopter X subscriber_friend_cnt
+  ggplot() + 
+  geom_boxplot(aes(x = adopter, y = subscriber_friend_cnt,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of subscriber_friend",
+       title = "Fig 3.4 Boxplot of the number of subscriber friends",
+       subtitle = "Whole data") +
+  theme(legend.position = c(0.95, 0.95)),
+
+df %>% # adopter X subscriber_friend_cnt
+  filter(subscriber_friend_cnt < 50) %>%
+  ggplot() + 
+  geom_boxplot(aes(x = adopter, y = subscriber_friend_cnt,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of subscriber_friend",
+       title = "",
+       subtitle = "where below 50") +
+  theme(legend.position = c(0.95, 0.95))
+)
+```
+
+#### lovedTracks
+
+```{r lovedTracks}
+ggpubr::ggarrange(
+df %>% # adopter X lovedTracks
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = lovedTracks,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of tracks loved",
+       title = "Fig 3.5 Boxplot of the number of LovedTracks",
+       subtitle = "Whole data") +
+  theme(legend.position = c(0.95, 0.95)),
+
+df %>% # adopter X lovedTracks
+  filter(lovedTracks < 500) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = lovedTracks,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of tracks loved",
+       title = "",
+       subtitle = "Where below lovedTracks < 500") +
+  theme(legend.position = c(0.95, 0.95))
+)
+```
+
+#### playlists
+
+```{r playlists}
+ggpubr::ggarrange(
+dt2 %>% # adopter X playlists
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = playlists, 
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of playlists",
+       title = "Fig 3.6 Boxplot of the number of playllists",
+       subtitle = "Whole data") +
+  theme(legend.position = c(0.95, 0.95)),
+
+dt2 %>% # adopter X playlists
+  filter(playlists < 30) %>% 
+  # too many outliers
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = playlists, 
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of playlists",
+       title = "",
+       subtitle = "Where below playlists < 30") +
+  theme(legend.position = c(0.95, 0.95))
+)
+```
+
+#### shouts
+
+```{r shouts}
+ggpubr::ggarrange(
+df %>% # adopter X shouts
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = shouts,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of shouts",
+       title = "Fig 3.7 Boxplot of the number of shouts",
+       subtitle = "Whole data") +
+  scale_y_continuous(labels = scales::comma) +
+  theme(legend.position = c(0.95, 0.95)),
+
+df %>% # adopter X shouts
+  filter(shouts < 50) %>% 
+  ggplot() +
+  geom_boxplot(aes(x = adopter, y = shouts,
+                   fill = adopter), width = 0.6) +
+  labs(x = "", y = "# of shouts",
+       title = "",
+       subtitle = "Where below shouts < 50") +
+  theme(legend.position = c(0.95, 0.95))
+)
+```
+
+
+### Categorical variables {.tabset}
+
+
+#### age_group
+
+```{r age_group}
+xtabs(~adopter + age_gr, df)
+
+df %>% group_by(age_gr, adopter) %>% tally() %>%
+  ungroup() %>% group_by(age_gr) %>% 
+  mutate(tot = sum(n), perc = round(n/tot, 3)) %>% 
+  ggplot() +
+  geom_col(aes(x = age_gr, y = n, fill = adopter),
+           position = "dodge", width = 0.6) +
+  geom_text(aes(x = age_gr, y = n, label = perc),
+            vjust = -0.5,
+            size = 3.5) +
+  scale_y_continuous(labels = scales::comma) +
+  labs(x = "", y = "# of age group count",
+       title = "Fig 3.8 Age group distribution",
+       subtitle = "Adopter 0: Free, 1: Premium")
+
+```
+
+
+#### gender_group
+The original male which is renamed as gender has 36% missing. We discovered that it could be defined as three or two groups; male, female, and unknown or whether gender is known or unknown. 
+
+```{r gender_group}
+xtabs(~ adopter + gender_gr, df)
+
+df %>% group_by(gender_gr, adopter) %>% tally() %>%
+  ungroup() %>% group_by(gender_gr) %>% 
+  mutate(tot = sum(n), perc = round(n/tot, 3)) %>% 
+  ggplot() + 
+  geom_col(aes(x = gender_gr, y = n, fill = adopter),
+           position = "dodge", width = 0.6) +
+  geom_text(aes(x = gender_gr, y = n, label = perc),
+            position = position_dodge(.9), vjust = -0.5,
+            size = 3.5) +
+  scale_y_continuous(label = scales::comma) +
+  labs(x = "", y = "# of gender count",
+       title = "Fig 3.9 Gender Distribution",
+       subtitle = "Adopter 0: Free, 1: Premium") +
+  theme(legend.position = c(0.95, 0.95))
+  
+```
+
+
+#### good_country_group
+
+```{r good_country_group}
+xtabs(~ adopter + good_country, df)
+
+df %>% group_by(good_country, adopter) %>% tally() %>%
+  ungroup() %>% group_by(good_country) %>% 
+  mutate(tot = sum(n), perc = round(n/tot, 3)) %>% 
+  ggplot() + 
+  geom_col(aes(x = good_country, y = n, fill = adopter),
+           position = "dodge", width = 0.6) +
+  geom_text(aes(x = good_country, y = n, label = perc),
+            position = position_dodge(.5), vjust = -0.5,
+            size = 3.5) +
+  scale_y_continuous(label = scales::comma) +
+  labs(x = "", y = "# of good country count",
+       title = "Fig 3.10 Good country Distribution",
+       subtitle = "Adopter 0: Free, 1: Premium") +
+  theme(legend.position = c(0.95, 0.95))
+
+```
+
+
+## Modeling
+
+This is imbalanced data because the ratio of the premium is 7%. Thus, it would be better to compare which sampling methods are appropriate. In addition, we discovered some extreme values through the Exploratory Data Analysis so we would delete these. On the current basis, the total data is `r scales::comma(nrow(dt2))`
+
+data is filtered by the below conditions;
+
+  - friend_cnt < 50,
+  - friend_country_cnt < 25, 
+  - songsListened < 100000, 
+  - subscriber_friend_cnt < 50, 
+  - lovedTracks < 500, 
+  - playlists < 30, 
+  - shouts < 50
+
+```{r delete_extrems}
+
+df2 <- df %>% filter(friend_cnt < 50,
+              friend_country_cnt < 25, 
+              songsListened < 100000, 
+              subscriber_friend_cnt < 50, 
+              lovedTracks < 500, 
+              playlists < 30, 
+              shouts < 50)
+```
+
+
+### sampling methods
+
+```{r compare_sampling}
+
+set.seed(2021)
+
+df2_sample <- df2 %>% 
+  select(-ID) %>% 
+  rsample::initial_split(., 0.7, strata = adopter)
+
+df2_tr <- df2_sample %>% training()
+df2_te <- df2_sample %>% testing()
+
+rf <- ranger::ranger(adopter~., data = df2_tr,
+                     num.trees = 100, mtry = 10,
+                     importance = "permutation")
+
+over_sample <- ROSE::ovun.sample(adopter~., data = df2_tr,
+                                 method = "over")$data
+table(over_sample$adopter)
+rfover <- ranger::ranger(adopter~., data = over_sample,
+                         num.trees = 100, mtry = 10,
+                         importance = "permutation")
+
+under_sample <- ovun.sample(adopter~., data = df2_tr,
+                                 method = "under")$data
+table(under_sample$adopter)
+rfunder <- ranger::ranger(adopter~., data = under_sample,
+                         num.trees = 100, mtry = 10,
+                         importance = "permutation")
+
+both_sample <- ovun.sample(adopter~., data = df2_tr, 
+                           method = "both")$data
+table(both_sample$adopter)
+rfboth <- ranger::ranger(adopter~., data = both_sample,
+                         num.trees = 100, mtry = 10,
+                         importance = "permutation")
+
+sample_metric = function(CM){
+  TN =CM[1,1]
+  TP =CM[2,2]
+  FP =CM[1,2]
+  FN =CM[2,1]
+  precision =(TP)/(TP+FP) # sensitivity
+  recall_score =(FP)/(FP+TN) # specificity
+ 
+  f1_score=2*((precision*recall_score)/(precision+recall_score))
+  accuracy_model  =(TP+TN)/(TP+TN+FP+FN)
+  False_positive_rate =(FP)/(FP+TN)
+  False_negative_rate =(FN)/(FN+TP)
+
+  x = list(
+    sens = round(precision, 5),
+    spec = round(recall_score, 5),
+    False_Peg = round(False_positive_rate, 5),
+    False_Neg = round(False_negative_rate, 5),
+    accuracy = round(accuracy_model, 5),
+    f1_score = round(f1_score, 5)
+  ) %>% as.data.frame()
+  return(x)
+}
+sampling_method = cbind.data.frame(
+  method = c("None", "Over", "Under", "Both"),
+  metric = rbind(
+    sample_metric(rf$confusion.matrix),
+    sample_metric(rfover$confusion.matrix),
+    sample_metric(rfunder$confusion.matrix),
+    sample_metric(rfboth$confusion.matrix)))
+sampling_method
+```
+
+Based on `f1_score`, `Under` sampling has the highest value among the sampling technique. Although the accuracy is lower than other sampling methods, it shows a realistic accuracy as a general rule of thumb.
+
+### Random Forest
+
+`Random Forest` is a known technique using decision trees. It could be used for regression and classification. Using this algorithm, we would check the variable importance, probability.
+
+```{r ranger, warning=FALSE}
+
+df2_recipe <- 
+  recipes::recipe(adopter ~ ., data = df2_tr) %>% 
+  step_dummy(age_gr, gender_gr, good_country) %>% 
+  step_corr(all_predictors(), -all_outcomes()) %>% 
+  step_zv(all_numeric()) %>% 
+  step_normalize(all_numeric(), -all_outcomes()) %>% 
+  step_downsample(adopter) %>%
+  prep(., retain = TRUE)
+df2_recipe
+
+df2_testing <- df2_recipe %>%
+  bake(testing(df2_sample)) 
+df2_training <- juice(df2_recipe)
+
+df2_ranger <- rand_forest(#trees = 100, mtry = 10, 
+                          mode = "classification") %>%
+  set_engine("ranger", importance = "permutation") %>%
+  fit(adopter ~ ., data = df2_training)
+
+```
+
+#### Scoring 
+
+```{r scoring}
+
+# df2_tr_pred <- df2_ranger %>%
+#   predict(df2_training) %>%
+#   bind_cols(df2_training)
+# xtabs(~ adopter + .pred_class, df2_tr_pred)
+# sample_metric(xtabs(~ adopter + .pred_class, df2_tr_pred))
+
+
+df2_te_pred <- df2_ranger %>%
+  predict(df2_testing) %>%
+  bind_cols(df2_testing)
+
+xtabs(~ adopter + .pred_class, df2_te_pred)
+sample_metric(xtabs(~ adopter + .pred_class, df2_te_pred))
+
+df2_te_probs <- df2_ranger %>%
+  predict(df2_testing, type = "prob") %>%
+  bind_cols(df2_testing)
+
+df2_te_probs %>%
+  ggplot() +
+  geom_density(aes(x = .pred_1, fill = adopter), 
+               alpha = 0.5) +
+  scale_x_continuous(labels = scales::percent) +
+  labs(x = "# of Predicted as 1",
+       title = "Fig 4. Density distribution of predicted as Premium customer") +
+  theme(legend.position = c(0.95, 0.95))
+
+
+predict(df2_ranger, df2_testing, type = "prob") %>%
+  bind_cols(predict(df2_ranger, df2_testing)) %>%
+  bind_cols(select(df2_testing, adopter)) %>% 
+  tail(5)
+```
+
+
+#### variable importance
+
+```{r variable_importance, message=FALSE}
+
+require(vip)
+vip(df2_ranger)
+
+```
+
+
+## Conclusion + further possible analysis
+
+Based on our predefined question, we can conclude as below;
+
+- In the random forest model, the variable with the most impact is `lovedTracks`, `songsListened`, and `subscriber_friend_cnt`. This supports evidence of the assumption based on the Exploratory Data Analysis. We could interpret that the user's activity(listening to songs, the number of friends) is the main key to the premium customer. On the other hand, the demographic variables(gender, age, good_country) have relatively less important value in the random forest model.
+- Use the score to customer target segmentation whether the model predicts as `0(Free customer)` or `1(Premium customer)`. The default threshold is 0.5, however, it could be changed depending on the business purpose.
+
+Further possibility:
+
+- Model tuning could find the best parameter of the random forest model
+- If there are more premium customers, the imbalanced problem possibly could be removed.
+- Improving how to collect the data for preventing high missing variables
+- Outliers can be treated as one of the segments when defining VIP customers.
+- If there are other variables(monetary, visiting time), RFM analysis would be possible to consider for customer segmentation.
+- If there is a post_adoptor(whether the customer would stay after x months later), churn analysis would be possible with the premise of other variables remaining equal.
